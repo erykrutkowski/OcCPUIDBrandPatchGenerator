@@ -1,0 +1,4 @@
+Self-test passed.
+Known 25F80 displacement: -0xB1 -> -0xA8
+Generated test Find:    48 8D B5 4F FF FF FF 66 2E 0F 1F 84
+Generated test Replace: 48 8D B5 58 FF FF FF 66 2E 0F 1F 84
