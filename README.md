@@ -1,4 +1,4 @@
-# CPUID Brand Patch Generator v1.0.3
+# CPUID Brand Patch Generator v1.1.1
 
 This tool generalizes the working macOS `25F80` patch. It analyzes the
 currently installed **x86_64** kernel instead of using fixed addresses or fixed
@@ -108,6 +108,46 @@ or equivalently:
 ```xml
 <data/>
 ```
+
+
+## After macOS or kernel updates
+
+macOS updates can change the compiled `_cpuid_set_info` / `_cpuid_set_generic_info`
+instruction layout. In that case an old `Kernel -> Patch` entry may remain in
+`config.plist`, but it may no longer match the new kernel bytes.
+
+After every system/kernel update, boot once and check:
+
+```bash
+sysctl -n machdep.cpu.brand_string
+```
+
+If the unwanted prefix is back, run the generator again. When the runtime brand
+still has a prefix, the script will:
+
+- print all existing CPUID brand patches found in `config.plist`;
+- treat those old patches as stale or not applicable to the current boot;
+- generate a new patch from the current kernel;
+- print the old and new patch dictionaries;
+- ask before modifying `config.plist`;
+- remove the old generated CPUID brand patch entries and add the new one;
+- write `config-change-log.txt` beside the generated analysis files.
+
+Use `--keep-existing` only when you deliberately want to append the new patch
+without removing old CPUID brand patches.
+
+## revcpuname check
+
+The script also scans:
+
+```text
+NVRAM -> Add -> revcpuname
+```
+
+If a `revcpuname` value exists and contains the same kind of unwanted prefix,
+the script prints the old and normalized value and asks whether to update it.
+With `--yes`, prefixed `revcpuname` values are updated automatically. Use
+`--no-revcpuname` to skip this check.
 
 ## Safety behavior
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.1.1
+
+- Rebuilds the repo patch as a proper repository-root `git diff` so `git apply` works from the project root.
+- Removes the accidental `/mnt/data/...` paths from the distributed patch artifact.
+- No runtime behavior changes from v1.1.0.
+
+## v1.1.0
+
+- Changes stale-patch handling after macOS/kernel updates: when the runtime CPU brand still has a removable prefix, old generated CPUID brand patches in `config.plist` are printed and replaced with newly generated values after confirmation.
+- Adds `config-change-log.txt` with old patch, new patch, and revcpuname update details.
+- Adds `NVRAM -> Add -> revcpuname` scanning and optional prefix removal.
+- Adds `--keep-existing` to append without removing stale patches.
+- Adds `--no-revcpuname` to skip revcpuname checks.
+- Updates README with system/kernel update workflow and revcpuname behavior.
+
 ## v1.0.3
 
 - Adds post-reboot verification using `sysctl -n machdep.cpu.brand_string`.

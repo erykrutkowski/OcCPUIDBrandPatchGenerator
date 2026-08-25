@@ -8,7 +8,7 @@ a patch when it recognizes the compiled leading-space-removal loop around the
 CPUID brand buffer. It does not use a fixed kernel address or fixed stack
 offset.
 
-Version 1.0.3
+Version 1.1.1
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-VERSION = "1.0.3"
+VERSION = "1.1.1"
 GENERATOR_MARKER = "CPUIDBrandAuto"
 DEFAULT_CONFIG = Path("/Volumes/EFI/EFI/OC/config.plist")
 DEFAULT_KC = Path("/System/Library/KernelCollections/BootKernelExtensions.kc")
@@ -1032,6 +1032,345 @@ def find_existing_current_patch(
     return None
 
 
+def find_all_cpuid_brand_patches(
+    config: dict[str, Any],
+) -> list[tuple[int, dict[str, Any]]]:
+    patches = config.get("Kernel", {}).get("Patch", [])
+    if not isinstance(patches, list):
+        return []
+
+    found: list[tuple[int, dict[str, Any]]] = []
+    for index, entry in enumerate(patches):
+        if looks_like_cpuid_brand_patch(entry):
+            found.append((index, entry))
+    return found
+
+
+def patch_value_for_display(value: Any) -> str:
+    if isinstance(value, bytes):
+        return hex_bytes(value) if value else "<empty Data>"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+
+def patch_summary_lines(entry: dict[str, Any]) -> list[str]:
+    ordered_fields = (
+        "Arch",
+        "Base",
+        "Comment",
+        "Count",
+        "Enabled",
+        "Find",
+        "Identifier",
+        "Limit",
+        "Mask",
+        "MaxKernel",
+        "MinKernel",
+        "Replace",
+        "ReplaceMask",
+        "Skip",
+    )
+    width = max(len(field) for field in ordered_fields)
+    lines: list[str] = []
+    for field in ordered_fields:
+        if field in entry:
+            lines.append(
+                f"{field + ':':<{width + 2}}"
+                f"{patch_value_for_display(entry[field])}"
+            )
+    return lines
+
+
+def print_patch_dictionary(
+    entry: dict[str, Any],
+    *,
+    title: str,
+    index: int | None = None,
+) -> None:
+    print()
+    print(title)
+    if index is not None:
+        print(f"Kernel -> Patch index: {index}")
+    for line in patch_summary_lines(entry):
+        print(line)
+
+
+def print_patch_collection(
+    entries: Sequence[tuple[int, dict[str, Any]]],
+    *,
+    title: str,
+) -> None:
+    print()
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    if not entries:
+        print("No CPUID brand patches were found in config.plist.")
+        return
+
+    for index, entry in entries:
+        print_patch_dictionary(
+            entry,
+            title="Existing CPUID brand patch:",
+            index=index,
+        )
+
+
+def remove_cpuid_brand_patches(
+    config: dict[str, Any],
+) -> list[tuple[int, dict[str, Any]]]:
+    patches = validate_config_structure(config)
+    removed: list[tuple[int, dict[str, Any]]] = []
+    for index in range(len(patches) - 1, -1, -1):
+        entry = patches[index]
+        if looks_like_cpuid_brand_patch(entry):
+            removed.append((index, entry))
+            del patches[index]
+    removed.reverse()
+    return removed
+
+
+def decode_nvram_text_value(value: Any) -> tuple[str, str, bytes | None]:
+    if isinstance(value, str):
+        return value.rstrip("\x00"), "str", None
+
+    if isinstance(value, bytes):
+        trailing = b""
+        body = value
+        while body.endswith(b"\x00"):
+            trailing += b"\x00"
+            body = body[:-1]
+
+        try:
+            text = body.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            text = body.decode("latin-1")
+            encoding = "latin-1"
+
+        return text, encoding, trailing
+
+    raise TypeError(f"unsupported revcpuname value type: {type(value).__name__}")
+
+
+def encode_nvram_text_value(
+    normalized_text: str,
+    *,
+    original_value: Any,
+    encoding: str,
+    trailing: bytes | None,
+) -> Any:
+    if isinstance(original_value, str):
+        return normalized_text
+    if isinstance(original_value, bytes):
+        return normalized_text.encode(encoding) + (trailing or b"")
+    raise TypeError(f"unsupported revcpuname value type: {type(original_value).__name__}")
+
+
+def find_normalized_start(
+    text: str,
+    preferred_target: str | None,
+) -> tuple[str, int] | None:
+    candidates: list[tuple[int, str]] = []
+
+    if preferred_target:
+        index = text.find(preferred_target)
+        if index >= 0:
+            candidates.append((index, preferred_target))
+
+    for token in KNOWN_CANONICAL_TOKENS:
+        index = text.find(token)
+        if index >= 0:
+            candidates.append((index, token))
+
+    if not candidates:
+        return None
+
+    index, token = min(candidates, key=lambda item: item[0])
+    return token, index
+
+
+@dataclass(frozen=True)
+class RevCpuNameUpdate:
+    guid: str
+    key: str
+    old_value: Any
+    new_value: Any
+    old_text: str
+    new_text: str
+    skipped_prefix: str
+    value_type: str
+
+
+def find_revcpuname_updates(
+    config: dict[str, Any],
+    *,
+    preferred_target: str | None,
+) -> list[RevCpuNameUpdate]:
+    nvram = config.get("NVRAM")
+    if not isinstance(nvram, dict):
+        return []
+
+    add = nvram.get("Add")
+    if not isinstance(add, dict):
+        return []
+
+    updates: list[RevCpuNameUpdate] = []
+    for guid, values in add.items():
+        if not isinstance(values, dict):
+            continue
+
+        for key, value in values.items():
+            if str(key).lower() != "revcpuname":
+                continue
+
+            try:
+                text, encoding, trailing = decode_nvram_text_value(value)
+            except TypeError:
+                print()
+                print(
+                    f"revcpuname at NVRAM -> Add -> {guid} -> {key} has "
+                    f"unsupported type {type(value).__name__}; leaving it unchanged."
+                )
+                continue
+
+            normalized = find_normalized_start(
+                text,
+                preferred_target,
+            )
+            if normalized is None:
+                print()
+                print(
+                    f"revcpuname at NVRAM -> Add -> {guid} -> {key} does "
+                    "not contain a known normalized vendor token; leaving it unchanged."
+                )
+                continue
+
+            token, index = normalized
+            if index == 0:
+                print()
+                print(
+                    f"revcpuname at NVRAM -> Add -> {guid} -> {key} already "
+                    f"starts with {token!r}; no revcpuname update is needed."
+                )
+                continue
+
+            new_text = text[index:]
+            new_value = encode_nvram_text_value(
+                new_text,
+                original_value=value,
+                encoding=encoding,
+                trailing=trailing,
+            )
+            updates.append(
+                RevCpuNameUpdate(
+                    guid=str(guid),
+                    key=str(key),
+                    old_value=value,
+                    new_value=new_value,
+                    old_text=text,
+                    new_text=new_text,
+                    skipped_prefix=text[:index],
+                    value_type="Data" if isinstance(value, bytes) else "String",
+                )
+            )
+
+    return updates
+
+
+def print_revcpuname_updates(
+    updates: Sequence[RevCpuNameUpdate],
+) -> None:
+    print()
+    print("=" * 78)
+    print("REVCPUNAME CHECK")
+    print("=" * 78)
+
+    if not updates:
+        print("No revcpuname value with a removable prefix was found.")
+        return
+
+    for update in updates:
+        print()
+        print(f"NVRAM -> Add -> {update.guid} -> {update.key}")
+        print(f"Type:   {update.value_type}")
+        print(f"Before: {update.old_text}")
+        print(f"After:  {update.new_text}")
+        print(f"Prefix removed from revcpuname: {update.skipped_prefix!r}")
+
+
+def apply_revcpuname_updates(
+    config: dict[str, Any],
+    updates: Sequence[RevCpuNameUpdate],
+) -> None:
+    nvram = config.get("NVRAM")
+    if not isinstance(nvram, dict):
+        return
+    add = nvram.get("Add")
+    if not isinstance(add, dict):
+        return
+
+    for update in updates:
+        values = add.get(update.guid)
+        if not isinstance(values, dict):
+            continue
+        values[update.key] = update.new_value
+
+
+def write_change_log(
+    destination: Path,
+    *,
+    config_path: Path | None,
+    removed_patches: Sequence[tuple[int, dict[str, Any]]],
+    added_patch: dict[str, Any] | None,
+    revcpuname_updates: Sequence[RevCpuNameUpdate],
+    runtime_brand: str,
+    normalized_brand: str | None,
+) -> None:
+    lines: list[str] = []
+    lines.append(f"CPUID Brand Patch Generator v{VERSION} change log")
+    lines.append("")
+    lines.append(f"config.plist: {config_path if config_path else '<not modified>'}")
+    lines.append(f"runtime brand before reboot: {runtime_brand}")
+    if normalized_brand:
+        lines.append(f"expected brand after reboot: {normalized_brand}")
+    lines.append("")
+
+    if removed_patches:
+        lines.append("Removed old CPUID brand patches:")
+        for index, entry in removed_patches:
+            lines.append("")
+            lines.append(f"Kernel -> Patch[{index}]")
+            lines.extend(patch_summary_lines(entry))
+    else:
+        lines.append("Removed old CPUID brand patches: none")
+
+    lines.append("")
+    if added_patch is not None:
+        lines.append("Added CPUID brand patch:")
+        lines.extend(patch_summary_lines(added_patch))
+    else:
+        lines.append("Added CPUID brand patch: none")
+
+    lines.append("")
+    if revcpuname_updates:
+        lines.append("Updated revcpuname values:")
+        for update in revcpuname_updates:
+            lines.append("")
+            lines.append(f"NVRAM -> Add -> {update.guid} -> {update.key}")
+            lines.append(f"Type:   {update.value_type}")
+            lines.append(f"Before: {update.old_text}")
+            lines.append(f"After:  {update.new_text}")
+    else:
+        lines.append("Updated revcpuname values: none")
+
+    (destination / "config-change-log.txt").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+
 def find_exact_duplicate(
     config: dict[str, Any],
     patch: dict[str, Any],
@@ -1648,7 +1987,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Add the generated patch without the final confirmation prompt.",
+        help=(
+            "Apply generated changes without final confirmation prompts. "
+            "This also updates prefixed revcpuname values unless "
+            "--no-revcpuname is used."
+        ),
+    )
+    parser.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help=(
+            "When adding a new patch, keep old CPUID brand patches instead "
+            "of replacing them. By default, stale CPUID brand patches are "
+            "removed when the runtime brand still has a prefix."
+        ),
+    )
+    parser.add_argument(
+        "--no-revcpuname",
+        action="store_true",
+        help="Do not scan or update NVRAM -> Add -> revcpuname values.",
     )
     parser.add_argument(
         "--target",
@@ -1733,21 +2090,17 @@ def main() -> int:
 
     loaded_config: dict[str, Any] | None = None
     config_format: plistlib.PlistFormat | None = None
+    existing_patches: list[tuple[int, dict[str, Any]]] = []
 
     if config_path is not None:
         if config_path.is_file():
             loaded_config, config_format = load_plist(config_path)
             validate_config_structure(loaded_config)
-
-            if not args.ignore_existing:
-                existing = find_existing_current_patch(
-                    loaded_config,
-                    kernel_version,
-                )
-                if existing is not None:
-                    index, entry = existing
-                    print_existing_patch(index, entry, config_path)
-                    return 0
+            existing_patches = find_all_cpuid_brand_patches(loaded_config)
+            print_patch_collection(
+                existing_patches,
+                title="CPUID BRAND PATCHES CURRENTLY IN CONFIG.PLIST",
+            )
         else:
             print()
             print(f"Config path does not exist: {config_path}")
@@ -1778,23 +2131,80 @@ def main() -> int:
             interactive=interactive,
         )
 
+    revcpuname_updates: list[RevCpuNameUpdate] = []
+    if loaded_config is not None and not args.no_revcpuname:
+        revcpuname_updates = find_revcpuname_updates(
+            loaded_config,
+            preferred_target=target_substring,
+        )
+        print_revcpuname_updates(revcpuname_updates)
+
     if skip_bytes == 0:
         print()
         print(
             f"The current CPU brand already begins with "
-            f"{target_substring!r}; no prefix-removal patch is needed."
+            f"{target_substring!r}; no new prefix-removal kernel patch is needed."
         )
         if "revcpuname=" in boot_arguments:
             print(
                 "Note: kern.bootargs still contains revcpuname=. "
                 "The displayed brand may be affected by another patch."
             )
+
+        if not revcpuname_updates or config_path is None or loaded_config is None:
+            print("No config.plist changes are needed.")
+            return 0
+
+        if args.yes:
+            update_revcpuname = True
+        elif interactive:
+            answer = input(
+                "\nUpdate the prefixed revcpuname value(s) in config.plist? [y/N]: "
+            ).strip().lower()
+            update_revcpuname = answer in {"y", "yes"}
+        else:
+            update_revcpuname = False
+
+        if not update_revcpuname:
+            print("config.plist was not modified.")
+            return 0
+
+        apply_revcpuname_updates(loaded_config, revcpuname_updates)
+        backup = write_config_with_backup(
+            config_path,
+            loaded_config,
+            config_format if config_format is not None else plistlib.FMT_XML,
+        )
+        print()
+        print("revcpuname value(s) updated successfully.")
+        print(f"Modified: {config_path}")
+        print(f"Backup:   {backup}")
         return 0
 
     normalized_brand = cpu_brand[skip_bytes:]
     print()
     print(f"Detected removable prefix: {cpu_brand[:skip_bytes]!r}")
     print(f"Normalized result:         {normalized_brand!r}")
+
+    if existing_patches:
+        print()
+        print(
+            "Runtime check says the CPU brand still has a prefix, so any "
+            "existing CPUID brand patch in config.plist is treated as stale "
+            "or not applicable to the current boot. A new patch will be "
+            "generated for the current kernel."
+        )
+        if not args.keep_existing:
+            print(
+                "If you approve modification, the old CPUID brand patch "
+                "dictionary/dictionaries listed above will be removed and "
+                "replaced with the new one."
+            )
+        else:
+            print(
+                "--keep-existing was supplied; old CPUID brand patches will "
+                "be left in place and the new one will be appended."
+            )
 
     with tempfile.TemporaryDirectory(prefix="cpuid-brand-auto-") as temp:
         generated = generate_patch(
@@ -1841,18 +2251,33 @@ def main() -> int:
     print(f"Generated files: {output_dir}")
 
     if config_path is None:
+        write_change_log(
+            output_dir,
+            config_path=None,
+            removed_patches=[],
+            added_patch=None,
+            revcpuname_updates=[],
+            runtime_brand=cpu_brand,
+            normalized_brand=normalized_brand,
+        )
         print("No config.plist was modified.")
         return 0
 
     if loaded_config is None or config_format is None:
         loaded_config, config_format = load_plist(config_path)
         validate_config_structure(loaded_config)
+        existing_patches = find_all_cpuid_brand_patches(loaded_config)
+        if not args.no_revcpuname:
+            revcpuname_updates = find_revcpuname_updates(
+                loaded_config,
+                preferred_target=target_substring,
+            )
 
     exact_duplicate = find_exact_duplicate(
         loaded_config,
         generated.patch,
     )
-    if exact_duplicate is not None:
+    if exact_duplicate is not None and args.keep_existing:
         index, entry = exact_duplicate
         print_existing_patch(index, entry, config_path)
         return 0
@@ -1860,19 +2285,83 @@ def main() -> int:
     if args.yes:
         modify = True
     elif interactive:
-        answer = input(
-            f"\nAdd this patch to {config_path}? [y/N]: "
-        ).strip().lower()
+        prompt = f"\nModify {config_path} now?"
+        if existing_patches and not args.keep_existing:
+            prompt += (
+                "\nThis will remove the old CPUID brand patch(es) listed "
+                "above and add the newly generated patch."
+            )
+        if revcpuname_updates:
+            prompt += "\nThis will also update the prefixed revcpuname value(s)."
+        answer = input(prompt + "\n[y/N]: ").strip().lower()
         modify = answer in {"y", "yes"}
     else:
         modify = False
 
     if not modify:
+        write_change_log(
+            output_dir,
+            config_path=config_path,
+            removed_patches=[],
+            added_patch=None,
+            revcpuname_updates=[],
+            runtime_brand=cpu_brand,
+            normalized_brand=normalized_brand,
+        )
         print("config.plist was not modified.")
         return 0
 
     patches = validate_config_structure(loaded_config)
+    removed_patches: list[tuple[int, dict[str, Any]]] = []
+
+    if existing_patches and not args.keep_existing:
+        removed_patches = remove_cpuid_brand_patches(loaded_config)
+        print_patch_collection(
+            removed_patches,
+            title="REMOVED OLD CPUID BRAND PATCHES",
+        )
+
+    if (
+        exact_duplicate is not None
+        and not args.keep_existing
+        and not removed_patches
+    ):
+        # This is defensive; normally the duplicate is also removed above.
+        index, entry = exact_duplicate
+        print_existing_patch(index, entry, config_path)
+        return 0
+
+    patches = validate_config_structure(loaded_config)
     patches.append(generated.patch)
+
+    applied_revcpuname_updates: list[RevCpuNameUpdate] = []
+    if revcpuname_updates and not args.no_revcpuname:
+        if args.yes:
+            update_revcpuname = True
+        elif interactive:
+            answer = input(
+                "\nUpdate the prefixed revcpuname value(s) too? [y/N]: "
+            ).strip().lower()
+            update_revcpuname = answer in {"y", "yes"}
+        else:
+            update_revcpuname = False
+
+        if update_revcpuname:
+            apply_revcpuname_updates(loaded_config, revcpuname_updates)
+            applied_revcpuname_updates = list(revcpuname_updates)
+        else:
+            print("revcpuname value(s) were left unchanged.")
+
+    write_change_log(
+        output_dir,
+        config_path=config_path,
+        removed_patches=removed_patches,
+        added_patch=generated.patch,
+        revcpuname_updates=applied_revcpuname_updates,
+        runtime_brand=cpu_brand,
+        normalized_brand=normalized_brand,
+    )
+
     backup = write_config_with_backup(
         config_path,
         loaded_config,
@@ -1880,9 +2369,15 @@ def main() -> int:
     )
 
     print()
-    print("Patch added successfully.")
+    print("config.plist updated successfully.")
+    if removed_patches:
+        print(f"Removed old CPUID brand patches: {len(removed_patches)}")
+    print("Added new CPUID brand patch: 1")
+    if applied_revcpuname_updates:
+        print(f"Updated revcpuname values: {len(applied_revcpuname_updates)}")
     print(f"Modified: {config_path}")
     print(f"Backup:   {backup}")
+    print(f"Change log: {output_dir / 'config-change-log.txt'}")
     print()
     print(
         "Run the ocvalidate binary matching your OpenCore release before "
